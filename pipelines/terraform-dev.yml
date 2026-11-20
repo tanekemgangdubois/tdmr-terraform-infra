@@ -1,0 +1,119 @@
+
+trigger:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - name: TF_DIR
+    value: environments/dev
+  - name: TF_VERSION
+    value: '1.14.0'
+
+stages:
+- stage: Plan
+  displayName: Terraform Plan
+  jobs:
+  - job: Plan
+    steps:
+    - checkout: self
+
+    - bash: |
+        curl -fsSL -o terraform.zip \
+          "https://releases.hashicorp.com/terraform/$(TF_VERSION)/terraform_$(TF_VERSION)_linux_amd64.zip"
+        unzip -o terraform.zip
+        sudo mv terraform /usr/local/bin/
+        terraform version
+      displayName: Install Terraform
+
+    - task: AzureCLI@2
+      displayName: Terraform Init and Plan
+      inputs:
+        azureSubscription: sc-tdmr-dev
+        scriptType: bash
+        scriptLocation: inlineScript
+        addSpnToEnvironment: true
+        inlineScript: |
+          set -euo pipefail
+
+          export ARM_USE_OIDC=true
+          export ARM_USE_AZUREAD=true
+          export ARM_CLIENT_ID="$servicePrincipalId"
+          export ARM_TENANT_ID="$tenantId"
+          export ARM_OIDC_TOKEN="$idToken"
+          export ARM_SUBSCRIPTION_ID="$(SUBSCRIPTION_ID)"
+
+          cd "$(TF_DIR)"
+
+          terraform init \
+            -backend-config="resource_group_name=rg-tdmr-tfstate" \
+            -backend-config="storage_account_name=$(TFSTATE_STORAGE)" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=tdmr.dev.tfstate"
+
+          terraform fmt -check -recursive
+          terraform validate
+
+          terraform plan \
+            -var="subscription_id=$(SUBSCRIPTION_ID)" \
+            -out=tfplan
+
+          mkdir -p "$(Build.ArtifactStagingDirectory)/plan"
+          cp tfplan "$(Build.ArtifactStagingDirectory)/plan/"
+
+    - publish: $(Build.ArtifactStagingDirectory)/plan
+      artifact: terraform-plan
+
+- stage: Apply
+  displayName: Terraform Apply
+  dependsOn: Plan
+  condition: succeeded()
+  jobs:
+  - deployment: DeployInfrastructure
+    environment: tdmr-dev
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - download: current
+            artifact: terraform-plan
+
+          - bash: |
+              curl -fsSL -o terraform.zip \
+                "https://releases.hashicorp.com/terraform/$(TF_VERSION)/terraform_$(TF_VERSION)_linux_amd64.zip"
+              unzip -o terraform.zip
+              sudo mv terraform /usr/local/bin/
+            displayName: Install Terraform
+
+          - task: AzureCLI@2
+            displayName: Terraform Apply
+            inputs:
+              azureSubscription: sc-tdmr-dev
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+
+                export ARM_USE_OIDC=true
+                export ARM_USE_AZUREAD=true
+                export ARM_CLIENT_ID="$servicePrincipalId"
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_OIDC_TOKEN="$idToken"
+                export ARM_SUBSCRIPTION_ID="$(SUBSCRIPTION_ID)"
+
+                cd "$(TF_DIR)"
+
+                terraform init \
+                  -backend-config="resource_group_name=rg-tdmr-tfstate" \
+                  -backend-config="storage_account_name=$(TFSTATE_STORAGE)" \
+                  -backend-config="container_name=tfstate" \
+                  -backend-config="key=tdmr.dev.tfstate"
+
+                terraform apply \
+                  "$(Pipeline.Workspace)/terraform-plan/tfplan"
